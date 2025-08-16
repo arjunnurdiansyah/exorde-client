@@ -121,16 +121,32 @@ def batch_sentiment_analysis(documents: list[str], models: dict) -> tuple[list[f
     fdb_scores = []
     for prediction in fdb_predictions:
         if isinstance(prediction, list):
-            prediction = prediction[0] if prediction else {}
-        fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in prediction}
+            # prediction is a list of label/score dicts, filter valid ones
+            prediction_list = [p for p in prediction if isinstance(p, dict) and "label" in p and "score" in p]
+        elif isinstance(prediction, dict) and "label" in prediction and "score" in prediction:
+            # prediction is a single label/score dict, wrap in list
+            prediction_list = [prediction]
+        else:
+            # prediction is empty or malformed, use empty list
+            prediction_list = []
+        
+        fdb_sentiment_dict = {e["label"].lower(): round(e["score"], 3) for e in prediction_list}
         fdb_scores.append(round(fdb_sentiment_dict.get("positive", 0) - fdb_sentiment_dict.get("negative", 0), 3))
     
     # Process GDB sentiment scores
     gdb_scores = []
     for prediction in gdb_predictions:
         if isinstance(prediction, list):
-            prediction = prediction[0] if prediction else {}
-        gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction}
+            # prediction is a list of label/score dicts, filter valid ones
+            prediction_list = [p for p in prediction if isinstance(p, dict) and "label" in p and "score" in p]
+        elif isinstance(prediction, dict) and "label" in prediction and "score" in prediction:
+            # prediction is a single label/score dict, wrap in list
+            prediction_list = [prediction]
+        else:
+            # prediction is empty or malformed, use empty list
+            prediction_list = []
+        
+        gen_distilbert_sent = {e["label"].lower(): round(e["score"], 3) for e in prediction_list}
         gdb_scores.append(round(gen_distilbert_sent.get("positive", 0) - gen_distilbert_sent.get("negative", 0), 3))
     
     return vader_scores, fin_vader_scores, fdb_scores, gdb_scores
