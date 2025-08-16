@@ -1,13 +1,10 @@
 import json
-import pandas as pd
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from finvader import finvader
 from huggingface_hub import hf_hub_download
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import tensorflow as tf
-import swifter
 import logging
 from exorde.models import (
     Classification,
@@ -104,169 +101,192 @@ def initialize_models(device):
     
     return models
 
-def tag(documents: list[str], lab_configuration):
-    # loading from lab configuration, previously initialized
-    models = lab_configuration["models"]
-    
-    for doc in documents:
-        assert isinstance(doc, str)
-
-    tmp = pd.DataFrame()
-    tmp["Translation"] = documents
-
-    assert tmp["Translation"] is not None
-    assert len(tmp["Translation"]) > 0    
-
-    logging.info("Starting Tagging Batch pipeline...")
-    model = models['sentence_transformer']
-    tmp["Embedding"] = tmp["Translation"].swifter.apply(
-        lambda x: list(model.encode(x).astype(float))
-    )
-
-    zs_pipe = models['zs_pipe']
-    classification_labels = list(lab_configuration["labeldict"].keys())
-    tmp["Classification"] = tmp["Translation"].swifter.apply(
-        lambda x: zs_pipe(x, candidate_labels=classification_labels)
-    )
-
-
-    text_classification_models = ["Emotion", "Irony", "TextType"]
-    for col_name in text_classification_models:
-        pipe = models[col_name]
-        tmp[col_name] = tmp["Translation"].swifter.apply(
-            lambda x: [(y["label"], float(y["score"])) for y in pipe(x)[0]]
-        )
-
-    tokenizer = models['bert_tokenizer']
-    tmp["Embedded"] = tmp["Translation"].swifter.apply(
-        lambda x: np.array(
-            tokenizer.encode_plus(
-                x,
-                add_special_tokens=True,
-                max_length=512,
-                truncation=True,
-                padding="max_length",
-                return_attention_mask=False,
-                return_tensors="tf",
-            )["input_ids"][0]
-        ).reshape(1, -1)
-    )
-
+def batch_sentiment_analysis(documents: list[str], models: dict) -> tuple[list[float], list[float], list[float], list[float]]:
+    """Optimized batch sentiment analysis"""
     sentiment_analyzer = models['sentiment_analyzer']
     fdb_pipe = models['fdb_pipe']
     gdb_pipe = models['gdb_pipe']
-
-    def vader_sentiment(text):
-        return round(sentiment_analyzer.polarity_scores(text)["compound"], 2)
     
-    def fin_vader_sentiment(text):
-        return round(finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound'), 2)
-
-    def fdb_sentiment(text):
-        prediction = fdb_pipe(text)
-        fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in prediction[0]}
-        return round(fdb_sentiment_dict["positive"] - fdb_sentiment_dict["negative"], 3)
-
-    def gdb_sentiment(text):
-        prediction = gdb_pipe(text)
-        gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction[0]}
-        return round(gen_distilbert_sent["positive"] - gen_distilbert_sent["negative"], 3)
+    # Batch process sentiment models
+    fdb_predictions = fdb_pipe(documents)
+    gdb_predictions = gdb_pipe(documents)
     
-    def compounded_financial_sentiment(text):
-        fin_vader_sent = fin_vader_sentiment(text)
-        fin_distil_score = fdb_sentiment(text)
-        return round((0.70 * fin_distil_score + 0.30 * fin_vader_sent), 2)
+    # Batch process VADER sentiment
+    vader_scores = [round(sentiment_analyzer.polarity_scores(text)["compound"], 2) for text in documents]
+    
+    # Batch process FinVADER sentiment  
+    fin_vader_scores = [round(finvader(text, use_sentibignomics=True, use_henry=True, indicator='compound'), 2) for text in documents]
+    
+    # Process FDB sentiment scores
+    fdb_scores = []
+    for prediction in fdb_predictions:
+        if isinstance(prediction, list):
+            prediction = prediction[0] if prediction else {}
+        fdb_sentiment_dict = {e["label"]: round(e["score"], 3) for e in prediction}
+        fdb_scores.append(round(fdb_sentiment_dict.get("positive", 0) - fdb_sentiment_dict.get("negative", 0), 3))
+    
+    # Process GDB sentiment scores
+    gdb_scores = []
+    for prediction in gdb_predictions:
+        if isinstance(prediction, list):
+            prediction = prediction[0] if prediction else {}
+        gen_distilbert_sent = {e["label"]: round(e["score"], 3) for e in prediction}
+        gdb_scores.append(round(gen_distilbert_sent.get("positive", 0) - gen_distilbert_sent.get("negative", 0), 3))
+    
+    return vader_scores, fin_vader_scores, fdb_scores, gdb_scores
+
+
+def compute_compound_sentiments(vader_scores: list[float], fin_vader_scores: list[float], 
+                               fdb_scores: list[float], gdb_scores: list[float]) -> tuple[list[float], list[float]]:
+    """Compute compound sentiments efficiently"""
+    compound_financial_sentiments = []
+    compound_sentiments = []
+    
+    for i in range(len(vader_scores)):
+        # Compound financial sentiment
+        fin_compound = round((0.70 * fdb_scores[i] + 0.30 * fin_vader_scores[i]), 2)
+        compound_financial_sentiments.append(fin_compound)
         
-    def compounded_sentiment(text):
-        gen_distilbert_sentiment = gdb_sentiment(text)
-        vader_sent = vader_sentiment(text)
-        compounded_fin_sentiment = compounded_financial_sentiment(text)
-        if abs(compounded_fin_sentiment) >= 0.6:
-            return round((0.30 * gen_distilbert_sentiment + 0.10 * vader_sent + 0.60 * compounded_fin_sentiment), 2)
-        elif abs(compounded_fin_sentiment) >= 0.4:
-            return round((0.40 * gen_distilbert_sentiment + 0.20 * vader_sent + 0.40 * compounded_fin_sentiment), 2)
-        elif abs(compounded_fin_sentiment) >= 0.1:
-            return round((0.60 * gen_distilbert_sentiment + 0.25 * vader_sent + 0.15 * compounded_fin_sentiment), 2)
+        # Compound general sentiment
+        if abs(fin_compound) >= 0.6:
+            compound = round((0.30 * gdb_scores[i] + 0.10 * vader_scores[i] + 0.60 * fin_compound), 2)
+        elif abs(fin_compound) >= 0.4:
+            compound = round((0.40 * gdb_scores[i] + 0.20 * vader_scores[i] + 0.40 * fin_compound), 2)
+        elif abs(fin_compound) >= 0.1:
+            compound = round((0.60 * gdb_scores[i] + 0.25 * vader_scores[i] + 0.15 * fin_compound), 2)
         else:
-            return round((0.60 * gen_distilbert_sentiment + 0.40 * vader_sent), 2)
+            compound = round((0.60 * gdb_scores[i] + 0.40 * vader_scores[i]), 2)
+        
+        compound_sentiments.append(compound)
+    
+    return compound_sentiments, compound_financial_sentiments
 
-    tmp["Sentiment"] = tmp["Translation"].swifter.apply(compounded_sentiment)
-    tmp["FinancialSentiment"] = tmp["Translation"].swifter.apply(compounded_financial_sentiment)
 
-    del tmp["Embedded"]
-    tmp = tmp.to_dict(orient="records")
-
-    _out = []
-    for i in range(len(tmp)):
-        # add Sentiment
-        sentiment = Sentiment(tmp[i]["Sentiment"])
-
-        # add Embedding
-        embedding = Embedding(tmp[i]["Embedding"])
-
-        # log tmp[i]["Classification"]
-        # logging.info(f"[TAGGING] classification item: {tmp[i]['Classification']}")
-        # they are of the form {'sequence': 'text', 'labels': ['label1', 'label2', ...], 'scores': [score1, score2, ...]}
-        # we keep only the top label and score into a Classification object (tuple)
-        top_label = tmp[i]["Classification"]["labels"][0]
-        top_score = round(tmp[i]["Classification"]["scores"][0], 4)
+def tag(documents: list[str], lab_configuration):
+    """Optimized batch tagging function"""
+    # Validate inputs
+    for doc in documents:
+        assert isinstance(doc, str)
+    
+    if not documents:
+        return []
+    
+    # Loading models from lab configuration
+    models = lab_configuration["models"]
+    
+    logging.info(f"Starting Optimized Tagging Batch pipeline for {len(documents)} documents...")
+    
+    # 1. BATCH EMBEDDING GENERATION
+    logging.info("Processing embeddings...")
+    sentence_transformer = models['sentence_transformer']
+    embeddings = sentence_transformer.encode(documents, convert_to_numpy=True, show_progress_bar=False)
+    embeddings_list = [list(emb.astype(float)) for emb in embeddings]
+    
+    # 2. BATCH CLASSIFICATION
+    logging.info("Processing classifications...")
+    zs_pipe = models['zs_pipe']
+    classification_labels = list(lab_configuration["labeldict"].keys())
+    classifications = zs_pipe(documents, candidate_labels=classification_labels)
+    
+    # 3. BATCH TEXT CLASSIFICATION (Emotion, Irony, TextType)
+    logging.info("Processing text classifications...")
+    text_classification_results = {}
+    text_classification_models = ["Emotion", "Irony", "TextType"]
+    
+    # Process each model in batch
+    for col_name in text_classification_models:
+        pipe = models[col_name]
+        predictions = pipe(documents)
+        # Convert to expected format
+        text_classification_results[col_name] = [
+            [(y["label"], float(y["score"])) for y in pred] if isinstance(pred, list) else [(pred["label"], float(pred["score"]))]
+            for pred in predictions
+        ]
+    
+    # 4. BATCH SENTIMENT ANALYSIS
+    logging.info("Processing sentiment analysis...")
+    vader_scores, fin_vader_scores, fdb_scores, gdb_scores = batch_sentiment_analysis(documents, models)
+    compound_sentiments, compound_financial_sentiments = compute_compound_sentiments(
+        vader_scores, fin_vader_scores, fdb_scores, gdb_scores
+    )
+    
+    # 5. BUILD RESULTS
+    logging.info("Building analysis results...")
+    results = []
+    
+    for i in range(len(documents)):
+        # Create sentiment
+        sentiment = Sentiment(compound_sentiments[i])
+        
+        # Create embedding
+        embedding = Embedding(embeddings_list[i])
+        
+        # Create classification
+        classification_result = classifications[i] if isinstance(classifications, list) else classifications
+        top_label = classification_result["labels"][0]
+        top_score = round(classification_result["scores"][0], 4)
         classification = Classification(label=top_label, score=top_score)
         
-        # mock gender
+        # Mock gender (as in original)
         gender = Gender(male=0.5, female=0.5)
-        types = {item[0]: item[1] for item in tmp[i]["TextType"]}
+        
+        # Text type
+        types = {item[0]: item[1] for item in text_classification_results["TextType"][i]}
         text_type = TextType(
-            assumption=types["Assumption"],
-            anecdote=types["Anecdote"],
-            none=types["None"],
-            definition=types["Definition"],
-            testimony=types["Testimony"],
-            other=types["Other"],
-            study=types["Statistics/Study"],
+            assumption=types.get("Assumption", 0.0),
+            anecdote=types.get("Anecdote", 0.0),
+            none=types.get("None", 0.0),
+            definition=types.get("Definition", 0.0),
+            testimony=types.get("Testimony", 0.0),
+            other=types.get("Other", 0.0),
+            study=types.get("Statistics/Study", 0.0),
         )
-
+        
         # Emotions
-        emotions = {item[0]: item[1] for item in tmp[i]["Emotion"]}
-        # round all values to 4 decimal places
+        emotions = {item[0]: item[1] for item in text_classification_results["Emotion"][i]}
+        # Round all values to 4 decimal places
         emotions = {k: round(v, 4) for k, v in emotions.items()}
         emotion = Emotion(
-            love=emotions["love"],
-            admiration=emotions["admiration"],
-            joy=emotions["joy"],
-            approval=emotions["approval"],
-            caring=emotions["caring"],
-            excitement=emotions["excitement"],
-            gratitude=emotions["gratitude"],
-            desire=emotions["desire"],
-            anger=emotions["anger"],
-            optimism=emotions["optimism"],
-            disapproval=emotions["disapproval"],
-            grief=emotions["grief"],
-            annoyance=emotions["annoyance"],
-            pride=emotions["pride"],
-            curiosity=emotions["curiosity"],
-            neutral=emotions["neutral"],
-            disgust=emotions["disgust"],
-            disappointment=emotions["disappointment"],
-            realization=emotions["realization"],
-            fear=emotions["fear"],
-            relief=emotions["relief"],
-            confusion=emotions["confusion"],
-            remorse=emotions["remorse"],
-            embarrassment=emotions["embarrassment"],
-            surprise=emotions["surprise"],
-            sadness=emotions["sadness"],
-            nervousness=emotions["nervousness"],
+            love=emotions.get("love", 0.0),
+            admiration=emotions.get("admiration", 0.0),
+            joy=emotions.get("joy", 0.0),
+            approval=emotions.get("approval", 0.0),
+            caring=emotions.get("caring", 0.0),
+            excitement=emotions.get("excitement", 0.0),
+            gratitude=emotions.get("gratitude", 0.0),
+            desire=emotions.get("desire", 0.0),
+            anger=emotions.get("anger", 0.0),
+            optimism=emotions.get("optimism", 0.0),
+            disapproval=emotions.get("disapproval", 0.0),
+            grief=emotions.get("grief", 0.0),
+            annoyance=emotions.get("annoyance", 0.0),
+            pride=emotions.get("pride", 0.0),
+            curiosity=emotions.get("curiosity", 0.0),
+            neutral=emotions.get("neutral", 0.0),
+            disgust=emotions.get("disgust", 0.0),
+            disappointment=emotions.get("disappointment", 0.0),
+            realization=emotions.get("realization", 0.0),
+            fear=emotions.get("fear", 0.0),
+            relief=emotions.get("relief", 0.0),
+            confusion=emotions.get("confusion", 0.0),
+            remorse=emotions.get("remorse", 0.0),
+            embarrassment=emotions.get("embarrassment", 0.0),
+            surprise=emotions.get("surprise", 0.0),
+            sadness=emotions.get("sadness", 0.0),
+            nervousness=emotions.get("nervousness", 0.0),
         )
-
+        
         # Irony
-        ironies = {item[0]: item[1] for item in tmp[i]["Irony"]}
-        irony = Irony(irony=ironies["irony"], non_irony=ironies["non_irony"])
+        ironies = {item[0]: item[1] for item in text_classification_results["Irony"][i]}
+        irony = Irony(irony=ironies.get("irony", 0.0), non_irony=ironies.get("non_irony", 0.0))
+        
         # Age (untrained model)
         age = Age(below_twenty=0.0, twenty_thirty=0.0, thirty_forty=0.0, forty_more=0.0)
+        
         # Language score (untrained model)
-        language_score = LanguageScore(1.0) # default value
-        # Add the analysis to the output list
+        language_score = LanguageScore(1.0)  # default value
+        
+        # Create analysis object
         analysis = Analysis(
             classification=classification,
             language_score=language_score,
@@ -278,6 +298,8 @@ def tag(documents: list[str], lab_configuration):
             irony=irony,
             age=age,
         )
-
-        _out.append(analysis)
-    return _out
+        
+        results.append(analysis)
+    
+    logging.info(f"Completed optimized tagging for {len(results)} documents")
+    return results
